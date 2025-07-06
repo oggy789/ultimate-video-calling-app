@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<title>CallGrid - Secure Video Calling</title>
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<!-- Firebase SDKs -->
+	<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+	<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-auth-compat.js"></script>
+	<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore-compat.js"></script>
+	<style>
+		/* ... (same as before) ... */
+	</style>
+</head>
+<body>
+	<!-- ... (same HTML as before) ... -->
+
+	<script>
+		// --- HTTPS Check for WebRTC ---
+		if (location.protocol !== 'https:' && location.hostname !== 'localhost') {
+			alert('WebRTC requires HTTPS. Please use a secure connection.');
+			throw new Error('WebRTC requires HTTPS');
+		}
+
+		// --- Firebase Config ---
+		const firebaseConfig = {
+			apiKey: "AIzaSyC70CIi1Vpb7XgZWX-poJc4qq71QsKUgRE",
+			authDomain: "video-call-web-app-b8ec5.firebaseapp.com",
+			projectId: "video-call-web-app-b8ec5",
+			storageBucket: "video-call-web-app-b8ec5.appspot.com",
+			messagingSenderId: "151896573985",
+			appId: "1:151896573985:web:59e026da61c35a8290fb60",
+			measurementId: "G-D0V3GJ52PT"
+		};
+		firebase.initializeApp(firebaseConfig);
+		const db = firebase.firestore();
+		const auth = firebase.auth();
+
+		// --- UI Elements ---
+		// ... (same as before) ...
+
+		// --- App State ---
+		// ... (same as before) ...
+
+		// --- ICE Server Configuration (STUN + TURN) ---
+		// NOTE: For production, use ephemeral TURN credentials from your backend!
+		const rtcConfig = {
+			iceServers: [
+				{ urls: 'stun:stun.l.google.com:19302' },
+				{
+					urls: 'turn:relay1.expressturn.com:3478',
+					username: '000000002066690725',
+					credential: 'AsXlPRNMx65zKHCoF4wAU4yBaRM='
+				}
+			]
+		};
+
+		// --- Authentication ---
+		googleSignInBtn.onclick = async () => {
+			try {
+				const provider = new firebase.auth.GoogleAuthProvider();
+				const result = await auth.signInWithPopup(provider);
+				currentUser = result.user;
+				displayNameInput.value = currentUser.displayName || '';
+				loginError.textContent = '';
+			} catch (err) {
+				loginError.textContent = err.message || 'Google sign-in failed.';
+			}
+		};
+
+		signOutBtn.onclick = async () => {
+			await cleanup();
+			await auth.signOut();
+			window.location.reload();
+		};
+
+		// --- Join/Create Room ---
+		joinForm.onsubmit = async (e) => {
+			e.preventDefault();
+			loginError.textContent = '';
+			let name = displayNameInput.value.trim();
+			roomId = roomIdInput.value.trim();
+			// Enforce strong room ID policy
+			if (!/^[a-zA-Z0-9_-]{8,32}$/.test(roomId)) {
+				loginError.textContent = 'Room ID must be 8-32 chars, only letters, numbers, - or _.';
+				return;
+			}
+			if (!name || name.length < 2) {
+				loginError.textContent = 'Name is required (min 2 chars).';
+				return;
+			}
+			if (!currentUser) {
+				loginError.textContent = 'Please sign in with Google to join.';
+				return;
+			}
+			roomLabel.textContent = roomId;
+			loginScreen.classList.add('hidden');
+			callScreen.classList.remove('hidden');
+			await startCall(name, roomId);
+		};
+
+		// --- WebRTC Setup ---
+		async function startCall(name, roomId) {
+			roomRef = db.collection('calls').doc(roomId);
+
+			// Get media with error handling
+			try {
+				localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+			} catch (err) {
+				showModal('Camera/mic permission denied or unavailable.');
+				await cleanup();
+				return;
+			}
+			localVideo.srcObject = localStream;
+			remoteStream = new MediaStream();
+			remoteVideo.srcObject = remoteStream;
+
+			pc = new RTCPeerConnection(rtcConfig);
+
+			localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+			pc.ontrack = event => {
+				event.streams[0].getTracks().forEach(track => remoteStream.addTrack(track));
+			};
+
+			const callerCandidatesCollection = roomRef.collection('callerCandidates');
+			const calleeCandidatesCollection = roomRef.collection('calleeCandidates');
+
+			pc.onicecandidate = event => {
+				if (event.candidate) {
+					const candidate = event.candidate.toJSON();
+					if (isCaller) {
+						callerCandidatesCollection.add(candidate);
+					} else {
+						calleeCandidatesCollection.add(candidate);
+					}
+				}
+			};
+
+			pc.onconnectionstatechange = () => {
+				if (pc.connectionState === 'connected') {
+					statusDiv.textContent = 'Peers connected ✅';
+				} else if (pc.connectionState === 'failed') {
+					statusDiv.textContent = 'Connection failed ❌';
+					showModal('Connection failed. Please try again or check your network.');
+					cleanup();
+				}
+			};
+
+			const roomSnapshot = await roomRef.get();
+			if (!roomSnapshot.exists) {
+				// Caller: create offer, store creator UID
+				isCaller = true;
+				const offer = await pc.createOffer();
+				await pc.setLocalDescription(offer);
+				const roomWithOffer = {
+					offer: { type: offer.type, sdp: offer.sdp },
+					created: firebase.firestore.FieldValue.serverTimestamp(),
+					callerName: name,
+					creatorUid: currentUser.uid
+				};
+				await roomRef.set(roomWithOffer);
+
+				unsubRoom = roomRef.onSnapshot(async snapshot => {
+					const data = snapshot.data();
+					if (!pc.currentRemoteDescription && data && data.answer) {
+						const answer = new RTCSessionDescription(data.answer);
+						await pc.setRemoteDescription(answer);
+						statusDiv.textContent = 'Live';
+					}
+					// Listen for hangup
+					if (data && data.ended) {
+						showModal('Call Ended');
+						cleanup();
+					}
+				});
+
+				unsubCalleeCandidates = calleeCandidatesCollection.onSnapshot(snapshot => {
+					snapshot.docChanges().forEach(change => {
+						if (change.type === 'added') {
+							const candidate = new RTCIceCandidate(change.doc.data());
+							pc.addIceCandidate(candidate).catch(()=>{});
+						}
+					});
+				});
+
+			} else {
+				// Callee: join with answer, only allow if not ended
+				isCaller = false;
+				const data = roomSnapshot.data();
+				if (!data.offer || data.ended) {
+					showModal('Room not available or already ended.');
+					return;
+				}
+				await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
+				const answer = await pc.createAnswer();
+				await pc.setLocalDescription(answer);
+				await roomRef.update({ answer: { type: answer.type, sdp: answer.sdp }, calleeName: name });
+
+				unsubCallerCandidates = callerCandidatesCollection.onSnapshot(snapshot => {
+					snapshot.docChanges().forEach(change => {
+						if (change.type === 'added') {
+							const candidate = new RTCIceCandidate(change.doc.data());
+							pc.addIceCandidate(candidate).catch(()=>{});
+						}
+					});
+				});
+
+				unsubRoom = roomRef.onSnapshot(snapshot => {
+					const data = snapshot.data();
+					if (data && data.ended) {
+						showModal('Call Ended');
+						cleanup();
+					}
+				});
+
+				statusDiv.textContent = 'Live';
+			}
+		}
+
+		// --- Mute/Unmute ---
+		muteBtn.onclick = () => {
+			if (!localStream) return;
+			isMuted = !isMuted;
+			localStream.getAudioTracks().forEach(track => track.enabled = !isMuted);
+			muteBtn.textContent = isMuted ? 'Unmute' : 'Mute';
+		};
+
+		// --- Hang Up ---
+		hangupBtn.onclick = async () => {
+			await endCall();
+		};
+
+		async function endCall() {
+			// Only creator can end the call
+			if (roomRef && currentUser && isCaller) {
+				await roomRef.update({ ended: true });
+				// Clean up Firestore candidates
+				const callerCandidates = await roomRef.collection('callerCandidates').get();
+				callerCandidates.forEach(doc => doc.ref.delete());
+				const calleeCandidates = await roomRef.collection('calleeCandidates').get();
+				calleeCandidates.forEach(doc => doc.ref.delete());
+			}
+			showModal('Call Ended');
+			await cleanup();
+		}
+
+		// --- Modal Handling ---
+		function showModal(msg) {
+			modalMsg.textContent = msg;
+			modal.style.display = 'flex';
+		}
+		modalCloseBtn.onclick = () => {
+			modal.style.display = 'none';
+			window.location.reload();
+		};
+
+		// --- Cleanup ---
+		async function cleanup() {
+			if (unsubRoom) unsubRoom();
+			if (unsubCallerCandidates) unsubCallerCandidates();
+			if (unsubCalleeCandidates) unsubCalleeCandidates();
+			if (pc) pc.close();
+			pc = null;
+			if (localStream) {
+				localStream.getTracks().forEach(track => track.stop());
+				localStream = null;
+			}
+			if (remoteStream) {
+				remoteStream.getTracks().forEach(track => track.stop());
+				remoteStream = null;
+			}
+			callScreen.classList.add('hidden');
+			loginScreen.classList.remove('hidden');
+		}
+
+		// --- Presence & Cleanup on Unload ---
+		window.addEventListener('beforeunload', async () => {
+			await endCall();
+		});
+
+		// --- Suggest a random room ID for better security ---
+		roomIdInput.placeholder = 'e.g. ' + Math.random().toString(36).slice(2, 10);
+
+		// --- SECURITY NOTE ---
+		// 1. Set strict Firestore security rules: only authenticated users, only room members can read/write.
+		// 2. For TURN, use ephemeral credentials from your backend for production.
+		// 3. Always sanitize user input before storing in Firestore (here, only .textContent is used).
+	</script>
+</body>
+</html>
